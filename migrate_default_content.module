@@ -24,11 +24,6 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
       if ($file != "." && $file != "..") {
         $language = '';
         $entity_type = $fileparts[0];
-        $is_revision = FALSE;
-        if (substr($entity_type, -9) === '_revision') {
-          $entity_type = substr($entity_type, 0, -9);
-          $is_revision = TRUE;
-        }
         $bundle = $fileparts[1];
         // If the file is a translation save the language that is informed in
         // the filename before the file extension.
@@ -69,8 +64,14 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
             'type' => $type,
             'filename' => $file,
             'language' => $language,
-            'is_revision' => $is_revision,
+            'is_revision' => FALSE,
           ];
+
+          if (\Drupal::entityTypeManager()->getDefinition($entity_type)->isRevisionable()) {
+            $id_revision = empty($language) ? 'migrate_default_content_' . $entity_type . '_revision_' . $bundle : 'migrate_default_content_' . $entity_type . '_revision_' . $bundle . '_' . $language;
+            $migrations[$id_revision] = $migrations[$id];
+            $migrations[$id_revision]['is_revision'] = TRUE;
+          }
 
         }
       }
@@ -99,6 +100,7 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
     // Assume the key is the first field of the csv.
     $key = trim(reset($headers));
 
+    $destination = $migration['is_revision'] ? 'entity_revision' : 'entity';
     $migration_plugin = [
       'id' => $id,
       'migration_group' => 'migrate_default_content',
@@ -106,7 +108,7 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
       'class' => '\Drupal\migrate\Plugin\Migration',
       'status' => 1,
       'destination' => [
-        'plugin' => 'entity:' . $migration['entity_type'],
+        'plugin' => $destination . ':' . $migration['entity_type'],
         'translations' => FALSE,
       ],
     ];
@@ -198,20 +200,37 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
 
         ];
 
+        if ($migration['is_revision']) {
+          $id_key = \Drupal::service('entity_type.manager')->getDefinition($migration['entity_type'])->getKey('id');
+          $id_no_revision = empty($migration['language']) ? 'migrate_default_content_' . $migration['entity_type'] . '_' . $migration['bundle'] : 'migrate_default_content_' . $migration['entity_type'] . '_' . $migration['bundle'] . '_' . $migration['language'];
+          $migration_plugin['process'][$id_key] = [
+            [
+              'plugin' => 'migration',
+              'migration' => $id_no_revision,
+              'source' => $key,
+            ],
+
+          ];
+
+          $migration_plugin['migration_dependencies']['required'][] = $id_no_revision;
+        }
+
         // If this an entity_reference field and a migrate_default_content
         // migration exists add it automatically.
+        /** @var \Drupal\Core\Field\FieldDefinitionInterface $field_definition */
         $field_definition = \Drupal::service('entity_field.manager')->getFieldDefinitions($migration['entity_type'], $migration['bundle'])[$field];
         // Handle special field types.
         if ($field_definition) {
-          $suffix = '';
+          $multiple = $field_definition->getFieldStorageDefinition()->getCardinality() !== 1;
+          $settings = $field_definition->getItemDefinition()->getSettings();
+          $properties = [];
           switch ($field_definition->getType()) {
             case 'entity_reference_revisions':
-              $suffix = '_revision';
+              $properties['target_revision_id'] = 'migrate_default_content_' . $settings['target_type'] . '_revision';
               // Intentional fall-through.
 
             case 'entity_reference':
-              $settings = $field_definition->getItemDefinition()->getSettings();
-              $target_entity_type = $settings['target_type'];
+              $properties['target_id'] = 'migrate_default_content_' . $settings['target_type'];
 
               // In the case of an entity reference the extra configuration is
               // the bundles it should reference.
@@ -221,22 +240,20 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
               if (!empty($extra)) {
                 // Add all posible referenceable bundles.
                 foreach ($extra as $target_bundle) {
-                  $target_id = 'migrate_default_content_' . $target_entity_type . $suffix . '_' . $target_bundle;
-                  $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $target_id);
+                  $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $properties, '_' . $target_bundle, $multiple);
                 }
               }
               // Assume is a entity with only one bundle. e.g. user.
               else {
-                $target_id = 'migrate_default_content_' . $target_entity_type . $suffix . '_' . $target_entity_type;
-                $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $target_id);
+                $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $properties, '_' . $settings['target_type'], $multiple);
               }
 
               break;
 
             case 'file':
             case 'image':
-              $target_id = 'migrate_default_content_file';
-              $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $target_id);
+              $properties['target_id'] = 'migrate_default_content_file';
+              $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $properties, '', $multiple);
 
               break;
 
@@ -255,21 +272,6 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
       $migration_plugin = array_merge_recursive($migration_plugin, $override);
     }
     $definitions[$id] = $migration_plugin;
-
-    if ($migration['is_revision']) {
-      $id_key = \Drupal::service('entity_type.manager')->getDefinition($migration['entity_type'])->getKey('id');
-      $revision_migration_plugin = $migration_plugin;
-      $revision_migration_plugin['id'] = str_replace($migration['entity_type'], $migration['entity_type'] . '_revision', $id);
-      $revision_migration_plugin['label'] = $revision_migration_plugin['id'];
-      $revision_migration_plugin['destination']['plugin'] = 'entity_revision:' . $migration['entity_type'];
-      $revision_migration_plugin['process'][$id_key] = [
-        'plugin' => 'migration',
-        'migration' => $id,
-        'source' => $key,
-      ];
-
-      $definitions[$revision_migration_plugin['id']] = $revision_migration_plugin;
-    }
   }
   if (isset($migrations['migrate_default_content_file'])) {
     $definitions['migrate_default_content_file'] = [
@@ -324,22 +326,50 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
 /**
  * Add a migration to the process pipeline with its dependency.
  */
-function migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $target_id) {
-  if (isset($migrations[$target_id])) {
-    $dest_subfield = explode('/', $dest_field);
-    if (isset($dest_subfield[1]) && ($dest_subfield[1] != 'target_id') && ($dest_subfield[1] != 'target_revision_id')) {
-      return $migration_plugin;
-    }
-    // We don't need a source because only the first process plugin in
-    // the pipeline should have it and we already have the explode plugin.
-    $migration_plugin['process'][$dest_field][] = [
-      'plugin' => 'migration',
-      'migration' => $target_id,
-      'no_stub' => TRUE,
+function migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $properties, $suffix, $multiple) {
+  if ($multiple) {
+    $process = [
+      'plugin' => 'iterator',
+      'process' => [],
     ];
-    // Avoid dependencies on itself.
-    if ($target_id != $migration_plugin['id']) {
-      $migration_plugin['migration_dependencies']['required'][] = $target_id;
+    foreach ($properties as $property_name => $target_id) {
+      if (isset($migrations[$target_id . $suffix])) {
+        $target_headers = $migrations[$target_id . $suffix]['first_line'];
+        // Assume the key is the first field of the csv.
+        $target_key = trim(reset($target_headers));
+
+        $process['process'][$property_name] = [
+          'plugin' => 'migration',
+          'migration' => $target_id . $suffix,
+          'source' => $target_key,
+          'no_stub' => TRUE,
+        ];
+        // Avoid dependencies on itself.
+        if ($target_id != $migration_plugin['id']) {
+          $migration_plugin['migration_dependencies']['required'][] = $target_id . $suffix;
+        }
+      }
+    }
+    $migration_plugin['process'][$dest_field][] = $process;
+  }
+  else {
+    foreach ($properties as $property_name => $target_id) {
+      if (isset($migrations[$target_id . $suffix])) {
+        if (isset($dest_subfield[1]) && ($dest_subfield[1] != $property_name)) {
+          return $migration_plugin;
+        }
+        // We don't need a source because only the first process plugin in
+        // the pipeline should have it and we already have the explode plugin.
+        $migration_plugin['process'][$dest_field][] = [
+          'plugin' => 'migration',
+          'migration' => $target_id . $suffix,
+          'no_stub' => TRUE,
+        ];
+        // Avoid dependencies on itself.
+        if ($target_id != $migration_plugin['id']) {
+          $migration_plugin['migration_dependencies']['required'][] = $target_id . $suffix;
+        }
+      }
     }
   }
   return $migration_plugin;
