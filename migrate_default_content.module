@@ -355,6 +355,7 @@ function migrate_default_content_add_target_migration($migrations, $migration_pl
   else {
     foreach ($properties as $property_name => $target_id) {
       if (isset($migrations[$target_id . $suffix])) {
+        $dest_subfield = explode('/', $dest_field);
         if (isset($dest_subfield[1]) && ($dest_subfield[1] != $property_name)) {
           return $migration_plugin;
         }
