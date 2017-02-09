@@ -190,15 +190,25 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
 
         $dest_field = empty($subfield) ? $field : $field . '/' . $subfield;
 
-        // It needs to be a normalized process.
-        // See: https://api.drupal.org/api/drupal/core!modules!migrate!src!Plugin!Migration.php/function/Migration%3A%3AgetProcessNormalized/
-        $migration_plugin['process'][$dest_field] = [
-          [
-            'plugin' => 'get',
-            'source' => $field . ucfirst($subfield) . (empty($extra) ? '' : ':' . implode(':', $extra)),
-          ],
-
-        ];
+        $source = $field . ucfirst($subfield) . (empty($extra) ? '' : ':' . implode(':', $extra));
+        if (!isset($migration_plugin['process'][$dest_field])) {
+          // It needs to be a normalized process.
+          // See: https://api.drupal.org/api/drupal/core!modules!migrate!src!Plugin!Migration.php/function/Migration%3A%3AgetProcessNormalized/
+          $migration_plugin['process'][$dest_field] = [
+            [
+              'plugin' => 'get',
+              'source' => [$source],
+            ],
+            [
+              'plugin' => 'extract',
+              'index' => [0],
+            ],
+          ];
+        }
+        // Do not merge the source for the ID field of revision migrations.
+        elseif ($migration_plugin['process'][$dest_field][0]['plugin'] === 'get') {
+          $migration_plugin['process'][$dest_field][0]['source'][] = $source;
+        }
 
         if ($migration['is_revision']) {
           $id_key = \Drupal::service('entity_type.manager')->getDefinition($migration['entity_type'])->getKey('id');
@@ -328,29 +338,48 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
  */
 function migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $properties, $suffix, $multiple) {
   if ($multiple) {
-    $process = [
-      'plugin' => 'iterator',
-      'process' => [],
-    ];
+    if (isset($migration_plugin['process'][$dest_field][3]) && ($migration_plugin['process'][$dest_field][3]['plugin'] === 'iterator')) {
+      $process = $migration_plugin['process'][$dest_field][3];
+    }
+    else {
+
+      $process = [
+        'plugin' => 'iterator',
+        'process' => [],
+      ];
+    }
     foreach ($properties as $property_name => $target_id) {
       if (isset($migrations[$target_id . $suffix])) {
         $target_headers = $migrations[$target_id . $suffix]['first_line'];
         // Assume the key is the first field of the csv.
         $target_key = trim(reset($target_headers));
 
-        $process['process'][$property_name] = [
-          'plugin' => 'migration',
-          'migration' => $target_id . $suffix,
-          'source' => $target_key,
-          'no_stub' => TRUE,
-        ];
+        if (!isset($process['process'][$property_name])) {
+          $process['process'][$property_name] = [
+            'plugin' => 'migration',
+            'migration' => [$target_id . $suffix],
+            'source' => $target_key,
+            'no_stub' => TRUE,
+          ];
+        }
+        elseif ($process['process'][$property_name]['plugin'] === 'migration') {
+          $process['process'][$property_name]['migration'][] = $target_id . $suffix;
+        }
         // Avoid dependencies on itself.
         if ($target_id != $migration_plugin['id']) {
           $migration_plugin['migration_dependencies']['required'][] = $target_id . $suffix;
         }
       }
     }
-    $migration_plugin['process'][$dest_field][] = $process;
+    $migration_plugin['process'][$dest_field][1] = [
+      'plugin' => 'callback',
+      'callable' => 'array_filter',
+    ];
+    $migration_plugin['process'][$dest_field][2] = [
+      'plugin' => 'callback',
+      'callable' => 'migrate_process_array_merge',
+    ];
+    $migration_plugin['process'][$dest_field][3] = $process;
   }
   else {
     foreach ($properties as $property_name => $target_id) {
@@ -374,4 +403,14 @@ function migrate_default_content_add_target_migration($migrations, $migration_pl
     }
   }
   return $migration_plugin;
+}
+
+function migrate_process_array_merge($value) {
+  $new_value = [];
+  if (!is_null($value)) {
+    foreach ($value as $array) {
+      $new_value = array_merge($new_value, $array);
+    }
+  }
+  return $new_value;
 }
