@@ -194,6 +194,7 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
 
         // If this an entity_reference field and a migrate_default_content
         // migration exists add it automatically.
+        /* @var \Drupal\Core\Field\FieldDefinitionInterface $field_definition */
         $field_definition = \Drupal::service('entity_field.manager')->getFieldDefinitions($migration['entity_type'], $migration['bundle'])[$field];
         // Handle special field types.
         if ($field_definition) {
@@ -208,30 +209,49 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
               if (isset($settings['handler_settings']['target_bundles'])) {
                 $extra = array_merge($extra, $settings['handler_settings']['target_bundles']);
               }
+              elseif (empty($extra)) {
+                /* @var \Drupal\Core\Entity\EntityTypeBundleInfoInterface $bundle_info */
+                $bundle_info = \Drupal::service('entity_type.bundle.info');
+                $extra = array_keys($bundle_info->getBundleInfo($target_entity_type));
+              }
               if (!empty($extra)) {
                 // Add all posible referenceable bundles.
+                $target_ids = [];
                 foreach ($extra as $target_bundle) {
-                  $target_id = 'migrate_default_content_' . $target_entity_type . '_' . $target_bundle;
-                  $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $target_id);
+                  $target_ids[] = 'migrate_default_content_' . $target_entity_type . '_' . $target_bundle;
                 }
+                $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $target_ids);
               }
               // Assume is a entity with only one bundle. e.g. user.
               else {
-                $target_id = 'migrate_default_content_' . $target_entity_type . '_' . $target_entity_type;
-                $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $target_id);
+                $target_ids = ['migrate_default_content_' . $target_entity_type . '_' . $target_entity_type];
+                $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $target_ids);
               }
 
               break;
 
             case 'file':
             case 'image':
-              $target_id = 'migrate_default_content_file';
-              $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $target_id);
+              $target_ids = ['migrate_default_content_file'];
+              $migration_plugin = migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $target_ids);
 
               break;
 
             default:
               break;
+          }
+
+          if ($field_definition->getFieldStorageDefinition()->isMultiple()) {
+            $migration_plugin['process'][$dest_field][] = [
+              'plugin' => 'callback',
+              'callable' => 'migrate_default_content_rekey_target_id'
+            ];
+          }
+          if ($field_definition->getType() === 'entity_reference_revisions') {
+            $migration_plugin['process'][$dest_field][] = [
+              'plugin' => 'add_target_revision_id',
+              'entity_type_id' => $target_entity_type,
+            ];
           }
         }
       }
@@ -299,8 +319,8 @@ function migrate_default_content_migration_plugins_alter(&$definitions) {
 /**
  * Add a migration to the process pipeline with its dependency.
  */
-function migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, $target_id) {
-  if (isset($migrations[$target_id])) {
+function migrate_default_content_add_target_migration($migrations, $migration_plugin, $dest_field, array $target_ids) {
+  if (array_intersect(array_keys($migrations), $target_ids)) {
     $dest_subfield = explode('/', $dest_field);
     if (isset($dest_subfield[1]) && $dest_subfield[1] != 'target_id') {
       return $migration_plugin;
@@ -309,13 +329,21 @@ function migrate_default_content_add_target_migration($migrations, $migration_pl
     // the pipeline should have it and we already have the explode plugin.
     $migration_plugin['process'][$dest_field][] = [
       'plugin' => 'migration',
-      'migration' => $target_id,
+      'migration' => $target_ids,
       'no_stub' => TRUE,
     ];
-    // Avoid dependencies on itself.
-    if ($target_id != $migration_plugin['id']) {
-      $migration_plugin['migration_dependencies']['required'][] = $target_id;
-    }
+
+      // Avoid dependencies on itself.
+    $dependencies = array_diff($target_ids, [$migration_plugin['id']]);
+    $migration_plugin += ['migration_dependencies' => []];
+    $migration_plugin['migration_dependencies'] += ['required' => []];
+    $migration_plugin['migration_dependencies']['required'] = array_merge($migration_plugin['migration_dependencies']['required'], $dependencies);
   }
   return $migration_plugin;
+}
+
+function migrate_default_content_rekey_target_id($value) {
+  if ($value) {
+    return ['target_id' => $value];
+  }
 }
